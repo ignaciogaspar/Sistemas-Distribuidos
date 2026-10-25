@@ -22,7 +22,7 @@
 | 8 | ¿Cómo junto causalidad, consenso y consistencia en un caso real? | Entrada VIP, PACELC, Dynamo vs. Spanner. |
 | 9 | ¿Dónde pongo las fronteras de la arquitectura? | Monolito modular vs. microservicios, sagas. |
 | 10 | ¿Cómo veo qué pasa adentro? | Observabilidad: logs, métricas, trazas. |
-| 11 | ¿Cómo decido de antemano cómo falla? | Resiliencia: degradar en lugar de caer. |
+| 11 | ¿Cómo evito que una falla local se vuelva global? | Timeouts, reintentos, circuit breaker, bulkheads, load shedding. |
 | 12 | ¿Cuándo funciona "suficientemente bien"? | SLI/SLO, error budget, chaos, incidentes, postmortems. |
 
 ---
@@ -1636,127 +1636,309 @@ Sobre saturación: muchos sistemas se degradan **antes del 100%**, y **el aument
 
 ---
 
-# Clase 11 — Resiliencia distribuida (timeouts, reintentos, circuit breakers, bulkheads)
-
-> ⚠️ **Nota:** en el repositorio no hay presentación ni apunte de la Clase 11. Esta sección está **reconstruida** a partir de lo que dicen de ella la Clase 10 ("Resiliencia distribuida: Circuit Breakers, Bulkheads y Backoff"), la Clase 12 (que retoma su ejemplo y sus mecanismos) y el simulacro de parcial. Conviene completarla con tus apuntes de esa clase.
+# Clase 11 — Resiliencia distribuida
 
 ## Pregunta central
 
-La Clase 10 permite **ver** que una dependencia se degradó. La Clase 11 responde: **¿cómo evito que una dependencia que falla arrastre a todo el sistema?** Es decir, **decidir de antemano de qué manera falla** el sistema, en lugar de dejar que lo decida la falla.
+En un sistema distribuido **la falla parcial es la condición normal**: siempre hay alguna dependencia lenta, algún nodo reiniciándose, alguna conexión cortada. La Clase 10 enseñó a **ver** las fallas; esta clase trata de **qué hace el sistema mientras ocurren**.
 
-## Caso conductor: el generador de contraseñas
+> La pregunta no es cómo evitar toda falla (imposible), sino **cómo impedir que una falla local se convierta en una falla global**: dado que una dependencia va a fallar, **¿en qué punto de la cadena corto la propagación y a qué costo?**
 
-Un servicio **generador** arma contraseñas que cumplen una política (mayúsculas, minúsculas, dígitos y especiales). Para eso llama a **cuatro servicios hijos**, uno por tipo de carácter.
+**Resiliencia** (en este curso): capacidad de seguir funcionando ante fallas parciales, aunque sea **degradado**. Una dependencia lenta o caída debe afectar **solo a la parte que la necesita, el menor tiempo posible y de forma entendible** para usuario y operador. No es lo mismo que disponibilidad total (que nada falle) ni que redundancia (tener una réplica): es la disciplina de **contener la propagación**.
 
-- Cada solicitud hace **5 llamadas a cada hijo = 20 llamadas** por solicitud. **Cualquier falla por llamada se multiplica por solicitud.**
-- **Dependencia oculta:** el servicio de minúsculas llama por dentro al de dígitos, y eso no figuraba en el diagrama.
-- **Degradación no aceptable:** si "especiales" no responde, devolver una contraseña sin especiales **viola la política** del usuario. No toda degradación es válida: depende de la promesa de negocio.
+## Falta, error y falla
 
-### La aritmética de las fallas en cadena
+| Término | Qué es | Ejemplo (caso aerolínea) |
+| --- | --- | --- |
+| **Fault (falta)** | Condición que crea un estado interno incorrecto (defecto latente que se dispara) | Tras conmutar la base, cerrar una consulta lanza una excepción no manejada y la conexión no vuelve al pool |
+| **Error** | Comportamiento **visiblemente** incorrecto | Los primeros llamantes reciben excepciones en vez de vuelos |
+| **Failure (falla)** | El sistema **no responde** | Pool agotado: la búsqueda de vuelos y los quioscos de check-in dejan de responder |
 
-Si "especiales" falla el **10%** de las llamadas y cada solicitud necesita 5 llamadas exitosas:
-- **Sin reintentos:** éxito = 0,9⁵ ≈ 0,59 → **falla el 41%** de las solicitudes.
-- **Con un reintento por llamada:** una llamada falla solo si fallan las dos (0,1 × 0,1 = 1%); éxito = 0,99⁵ ≈ 0,951 → **falla el 4,9%**.
+- **"La falla está en el ojo del observador":** una máquina puede estar encendida y no responder nada. En la aerolínea, el monitoreo miraba una página de estado y mostraba todo **sano** mientras todos los hilos estaban bloqueados. → La salud se mide **desde quien usa el servicio** (Clase 10).
+- **La grieta (crack):** falta → error → falla. En cada eslabón puede acelerar o frenarse; **el acoplamiento fuerte la acelera**. Disparador + forma de propagación + daño = **modo de falla**.
+- **Crackstoppers:** protecciones construidas a propósito para que el daño no avance, como las **zonas de deformación** de un auto. Si el diseño no define cómo falla el sistema, falla **como emerja**, que suele ser lo peor.
 
-El reintento mejora unas 8 veces, pero (como muestra la Clase 12) **todavía no alcanza** para un SLO de 99,9%.
+## El ejemplo recurrente: el generador de contraseñas
 
-**La seguridad no se compone:** un cliente con timeout de 50 ms que llama a dos proveedores de ~20 ms (casi nunca más de 30 ms) está bien con cada uno por separado; llamarlos **en serie** cumple en promedio (40 ms) pero falla cada vez que ambos están un poco lentos a la vez.
+Un servicio arma contraseñas llamando a **cuatro servicios hijos** (mayúsculas, minúsculas, dígitos, especiales), con **5 llamadas a cada hijo por pedido** (*fan-out*): cualquier política por llamada **se multiplica por pedido**. Además hay una **dependencia oculta**: minúsculas consulta internamente a dígitos (no figura en el diagrama). Se retoma en la Clase 12.
 
-## Falla rápida vs. falla lenta
+## Anatomía de una falla en cascada
 
-| Falla rápida (caída) | Falla lenta (latencia) |
+**Los puntos de integración son "el asesino número uno" de los sistemas**: cada conexión con otro sistema es una oportunidad de que su problema se vuelva tuyo. Descomponer en microservicios e integrar proveedores **multiplica** esos puntos.
+
+**Falla en cascada:** una grieta en una capa provoca una grieta en la capa que la llama. Necesita un **mecanismo de transmisión**, casi siempre **un pool de recursos que se agota** por una falla de abajo. **Una llamada sin timeout es la forma segura de provocarla.** Los servicios con muchos llamantes (*alto fan-in*) propagan más lejos sus problemas.
+
+### Falla rápida vs. falla lenta
+
+Una conexión rechazada vuelve en milisegundos; un paquete perdido puede dejar un hilo **bloqueado minutos**. El hilo bloqueado no atiende a nadie; si se bloquean todos, el servidor está caído "a todo fin práctico".
+
+> **Una dependencia lenta es más peligrosa que una caída**: la caída libera rápido los recursos del llamante; la lentitud los **retiene**. *"A slow response is a lot worse than no response."*
+
+### Hilos bloqueados: el sistema no "se cae", "se cuelga"
+
+La mayoría de las caídas reales son **procesos vivos con todos sus hilos esperando**. Por eso, con el sistema saturado, **la CPU está baja** (los hilos esperan E/S, no calculan). Un panel de CPU en verde es compatible con un servicio totalmente bloqueado → la saturación se mide sobre **el recurso que se agota** (hilos ocupados / disponibles).
+
+### Otros dos mecanismos de propagación
+
+- **Reacción en cadena:** 5 servidores iguales al 20% cada uno; cae uno → los otros 4 pasan al 25% (**+25% de carga cada uno**). Si la caída fue por una condición de carga (fuga de memoria, race condition), los sobrevivientes ahora son **más** propensos a caer: 33%, 50%… Como el defecto está en todos, **la única forma de frenarla es corregir el defecto**.
+- **Capacidades desbalanceadas:** un front end con 3.000 hilos llama a un servicio con 450. Normalmente no pasa nada, pero una promoción que lleve tráfico a ese camino lo desborda. Igualar capacidades suele ser inviable: **llamantes y proveedores deben resistir avalanchas**.
+
+### Ley de Little aplicada al pool de hilos
+
+> **L = λ · W** — elementos en el sistema = tasa de llegada × tiempo que permanece cada uno.
+
+*Analogía:* una peluquería con 2 clientes/hora que se quedan 1,5 h tiene en promedio 3 clientes adentro. Con 2 sillas no da abasto aunque nada esté "roto"; y si cada atención se alarga, L crece **sin que llegue un cliente más**.
+
+**En el generador:** λ = 5 pedidos/s y pool de 8 hilos.
+- Dependencias sanas: un pedido tarda ~0,05 s → L = 5 × 0,05 = **0,25 hilos** (pool holgado).
+- Una dependencia tarda 2 s por llamada × 5 llamadas secuenciales → cada pedido ocupa un hilo **10 s** → L = 5 × 10 = **50 hilos**. Con 8, satura: la tasa sostenible cae a 8/10 = **0,8 pedidos/s**, por más CPU que se agregue.
+
+> **Ninguna dependencia se cayó: alcanzó con que una se pusiera lenta. Cambió W, no λ.**
+
+**Tiempo de residencia = tiempo en cola + tiempo de procesamiento.** Medir solo el procesamiento engaña: el servidor cree que anda bien mientras el cliente ve lentitud. La cola es serial y a la larga **domina**. (Little sirve para dimensionar y predecir la saturación, no para modelar el sistema ya saturado.)
+
+## Las herramientas: cada una corta un tramo de la cadena
+
+| Herramienta | Qué corta |
 | --- | --- |
-| La dependencia rechaza la conexión o devuelve error enseguida | La dependencia responde, pero **muy tarde** |
-| El llamante se entera rápido y puede reaccionar | El llamante **retiene hilos, conexiones y memoria** esperando |
-| Relativamente fácil de tolerar | **La más peligrosa**: agota recursos y se propaga en cascada |
+| **Timeout** | La espera indefinida que convierte una dependencia lenta en hilos bloqueados |
+| **Reintento** | Las fallas transitorias (las recupera), a costa de más carga |
+| **Circuit breaker** | La insistencia contra una dependencia que ya se sabe enferma |
+| **Degradación elegante (fallback)** | El error que llega al usuario: responde algo útil en su lugar |
+| **Bulkhead** | Que una parte del sistema agote recursos que comparten las demás |
+| **Backpressure y load shedding** | La demanda mayor que la capacidad: frenar al productor o rechazar a tiempo |
 
-Muchos sistemas toleran bien que una dependencia **desaparezca** y muy mal que se vuelva **lenta**.
+Ninguna alcanza sola, y combinadas pueden interactuar mal.
 
-### Falla en cascada
+## 1. Timeouts
 
-1. Una dependencia se pone lenta.
-2. El servicio que la llama acumula hilos bloqueados y **agota su pool**.
-3. Deja de responder a **todos** sus clientes, incluso los que no usaban esa dependencia.
-4. Sus clientes reintentan y **amplifican** la carga.
-5. La falla sube hasta el borde (504 en el gateway).
+**Para qué:** dejar de esperar una respuesta que probablemente no llegará. *"Hope is not a design method."* Un timeout bien puesto **aísla la falla**: el problema de otro no se vuelve tuyo.
 
-Los mecanismos de esta clase existen para **cortar esa cadena** en algún punto.
+**El timeout no viene puesto.** Muchas librerías **esperan para siempre** por defecto: `requests` de Python no corta sin el parámetro `timeout`; `URLConnection` de Java interpreta 0 como infinito. Lo mismo para recursos internos: **todo pool que bloquea debe tener un plazo máximo de espera** (en la aerolínea, el pool de conexiones bloqueaba sin límite).
 
-## Mecanismos de resiliencia
+| Tipo | Qué acota | Valor típico |
+| --- | --- | --- |
+| **Connect timeout** | Establecer la conexión | Muy corto (dentro de un datacenter conectar es rápido) |
+| **Read / socket timeout** | Espera de datos una vez conectado | Reflejar la latencia normal de la dependencia |
+| **Connection request timeout** | Obtener una conexión del pool del cliente | Corto |
+| **Deadline (global)** | El tiempo **total** de la operación | Presupuesto de extremo a extremo |
 
-### 1. Timeouts y deadlines
+**Ojo:** el read timeout mide el tiempo **entre** datos recibidos, no el total: una respuesta que llega en fragmentos espaciados puede tardar mucho más sin que salte. Por eso hace falta además un **deadline**.
 
-**Qué es:** el tiempo máximo que espero una respuesta antes de rendirme.
+**Cómo elegir el valor:** a partir de la **distribución de latencia** medida en condiciones normales, **del lado del cliente** (incluye red y cola): típicamente **p99 de la línea de base + margen**. Basado en el promedio cortaría muchas llamadas normales; basado en el máximo casi nunca actuaría. Revisarlo cuando cambia la dependencia.
 
-**Por qué:** sin timeout, una dependencia lenta retiene recursos indefinidamente. **Muchas bibliotecas HTTP tienen por defecto timeout infinito**: nunca hay que depender del valor por defecto (el postmortem de la Clase 12 nace exactamente de eso).
-
-**Cadena de plazos:** en una cadena A → B → C, el timeout de A debe contemplar el de B, y el de B el de C (incluidos reintentos). Si minúsculas llama a dígitos, el timeout de minúsculas tiene que ser **mayor** que el de dígitos más su margen. Lo ideal es propagar un **deadline** absoluto: si ya venció, no tiene sentido seguir procesando.
-
-| Timeout corto | Timeout largo |
+| Timeout muy corto | Timeout muy largo |
 | --- | --- |
-| Libera recursos rápido | Tolera picos de latencia normales |
-| Falsos timeouts → más reintentos → más carga | Retiene hilos; propaga la lentitud |
+| Convierte la variabilidad normal en errores (y en reintentos) | No protege: los hilos siguen bloqueados |
 
-**Regla práctica:** fijarlo a partir de la latencia **medida** de la dependencia (ej.: algo por encima de su p99), no "a ojo".
+### Timeouts en una cadena A → B → C
 
-### 2. Reintentos con backoff y jitter
+Para el valor de partida alcanza con medir B desde A (ya incluye lo que B espera a C). Pero la línea de base **no muestra el peor caso interno**: si C falla, B espera su timeout completo, reintenta y vuelve a esperar. Si el timeout de A es menor que eso, **A abandona mientras B sigue trabajando** para una respuesta que nadie recibirá.
 
-Ya vistos en la Clase 2; acá se agrega su **costo sistémico**:
-- **Solo reintentar errores transitorios** (timeouts, 503) y **nunca** los errores del cliente (4xx): reintentar un request mal formado no lo arregla.
-- **Backoff exponencial** + **jitter** para no generar oleadas sincronizadas.
-- **Límite de intentos** y **presupuesto de reintentos** (ej.: que los reintentos no superen el 10% del tráfico). Si cada capa de una cadena de 3 niveles reintenta 3 veces, la capa de abajo puede recibir **27 veces** la carga: los reintentos **se multiplican** por capas.
-- **Siempre con la misma clave idempotente**, para no generar una segunda operación lógica (ej.: `i-42:autorizar`).
+> **Tmax = (1 + r) · t + Σ eᵢ** (t = timeout por intento, r = reintentos, eᵢ = esperas entre reintentos). **El Tmax de cada llamada interna tiene que caber dentro del timeout de quien la origina.** En cadenas largas se reparte un **presupuesto de tiempo de extremo a extremo**.
 
-### 3. Circuit breaker (disyuntor)
+### Timeouts y Fail Fast
 
-**Idea:** como un disyuntor eléctrico. Si una dependencia viene fallando, **dejar de llamarla un rato** y fallar rápido, en lugar de seguir esperando timeouts y sobrecargarla más.
+"Dos caras de la misma moneda": el **timeout** protege los pedidos **salientes**; **fail fast** rechaza de inmediato los pedidos **entrantes** que ya se sabe que van a fallar (recurso no disponible, breaker abierto, parámetros inválidos), en lugar de gastar recursos y descartar el resultado. **Fallar rápido no es funcionar**: los pedidos siguen fallando; recuperarlos es tarea de los mecanismos siguientes.
+
+## 2. Reintentos: cuándo ayudan y cuándo destruyen
+
+En la Clase 2 el reintento era la solución a un mensaje perdido. Frente a una dependencia **saturada**, es **el combustible de la cascada**.
+
+**La retroalimentación:** más carga → más tiempo de respuesta → se supera el timeout del llamante → **reintento "justo cuando más duele"** → más carga. Ejemplo: un backend atiende 10.000 req/s y recibe 10.100; rechaza 100, que se reintentan → recibe 10.200, rechaza 200 → 10.300… Cada vez más trabajo se dedica a pedidos que van a fallar, y **bajar la carga al nivel previo puede no alcanzar** mientras sigan los reintentos.
+
+**Cuándo sí:** ante **fallas transitorias** (paquete perdido, conexión reiniciada). Ante fallas persistentes o sobrecarga, son destructivos. Condiciones previas: **solo operaciones idempotentes** y **solo errores reintentables** (timeouts, errores de conexión, 5xx; **no** 4xx ni validación).
+
+### La cuenta de la amplificación
+
+> Un pedido con **n** llamadas independientes, cada una con probabilidad de falla **p**: **P(falla) = 1 − (1 − p)ⁿ**
+
+| Escenario (p = 10%, n = 5) | Falla por llamada | Falla del pedido | Intentos por llamada |
+| --- | --- | --- | --- |
+| Sin reintentos | 10% | 1 − 0,9⁵ ≈ **41%** | 1 |
+| Con 1 reintento | 0,1² = 1% | 1 − 0,99⁵ ≈ **4,9%** | 1 + p = 1,1 |
+| Con 2 reintentos | 0,1% | ≈ 0,5% | 1 + p + p² = 1,11 |
+
+**El fan-out amplifica** (10% por llamada → 41% por pedido). Y el costo del reintento es bajo **solo si las fallas son independientes**: si la causa es una caída o saturación, p → 1 y **cada llamada se vuelve 1 + r intentos justo sobre quien no puede más**.
+
+**Reintentos en varias capas se multiplican:** 3 capas × 3 intentos = **27** llamadas por pedido; si backend, frontend y JavaScript hacen 4 intentos cada uno, **4³ = 64** intentos sobre la base por una sola acción del usuario. → **Decidir en qué capa se reintenta**, no en todas.
+
+### Backoff exponencial
+
+> **dₙ = min(tope, base · mⁿ)**, típicamente m = 2.
+
+Ejemplo: base 100 ms, tope 1 s → esperas de 100, 200, 400… ms. Con 2 reintentos y timeout de 500 ms por intento: **Tmax = 3 × 500 + 300 = 1.800 ms**, que debe caber en el timeout del llamante.
+
+### Jitter
+
+Si todos los clientes que fallaron juntos esperan lo mismo, **reintentan juntos** (*dogpile* / *thundering herd*). El jitter agrega aleatoriedad:
+
+| Variante | Espera | Ejemplo (dₙ = 200 ms) | Trade-off |
+| --- | --- | --- | --- |
+| Sin jitter | dₙ | Todos a los 200 ms | Ola sincronizada |
+| **Full jitter** | U(0, dₙ) | 30, 120, 190 ms | Dispersa más; alguno puede reintentar casi enseguida |
+| **Equal jitter** | dₙ/2 + U(0, dₙ/2) | 110, 160, 195 ms | Garantiza una espera mínima; dispersa menos |
+
+**Backoff + jitter es el estándar** para clientes remotos. El jitter importa cuando hay **muchos** clientes fallando a la vez.
+
+### Presupuesto de reintentos (retry budget)
+
+Limitar los intentos por pedido **no alcanza**: si todo falla, todos agotan sus 3 intentos y la carga casi se triplica. Google combina:
+- **Por pedido:** máximo 3 intentos.
+- **Por cliente:** solo reintentar mientras los reintentos sean **< 10%** de lo que envía.
+
+Así, en el caso general el crecimiento queda en **1,1×**: si fallan pocos, se reintenta normal; si fallan muchos, se deja de reintentar y el error se propaga (lo correcto si el problema no es transitorio). Variante simple: un tope por proceso (ej.: 60 reintentos/min). **Un rechazo del circuit breaker nunca se reintenta.**
+
+### Caso Pokémon GO
+
+El tráfico real fue ~50× la estimación (se había probado 5×). Los backends se volvieron lentos en vez de rechazar, el balanceador reintentaba los GET y la app reintentaba con "un reintento inmediato y después backoff constante". Ráfagas de errores rápidos **sincronizaron** a los clientes → picos de **20×** el máximo previo. Se mitigó aislando y ampliando balanceadores y limitando tráfico; la corrección de fondo fue **backoff exponencial truncado con jitter**. Lección: sin dispersión, muchos clientes independientes se vuelven **una sola ola**, que puede tumbar incluso componentes ajenos (el balanceo global).
+
+## 3. Circuit breaker
+
+**Idea:** como el disyuntor eléctrico. Envuelve una operación peligrosa y **la evita** cuando la dependencia no está sana. A diferencia del reintento, existe para **prevenir** operaciones, no para repetirlas: degrada automáticamente bajo estrés.
 
 | Estado | Comportamiento | Transición |
 | --- | --- | --- |
-| **Cerrado** (normal) | Las llamadas pasan; se cuentan fallas | Si la tasa de fallas supera un umbral → **Abierto** |
-| **Abierto** | **Rechaza enseguida** sin llamar (o usa un fallback) | Pasado un tiempo de espera → **Semiabierto** |
-| **Semiabierto** (*half-open*) | Deja pasar **unas pocas llamadas de prueba** | Si salen bien → **Cerrado**; si fallan → **Abierto** |
+| **Closed** (normal) | Las llamadas se ejecutan y se registra el resultado | Si las fallas superan el umbral → **Open** |
+| **Open** | Las llamadas **fallan inmediatamente**, sin ejecutarse | Pasado el tiempo de espera → **Half-open** |
+| **Half-open** | Pasa **una (o pocas) llamada de prueba** | Éxito → **Closed**; falla → **Open** otra vez |
 
-- **Qué cuenta como falla:** errores 5xx y timeouts de la dependencia. **Los 4xx no** (son errores del cliente, no de la salud de la dependencia).
-- **Por qué sirve:** protege al llamante (no retiene recursos), le da aire a la dependencia para recuperarse y convierte una falla lenta en una falla **rápida y explícita**.
-- **Costo:** mientras está abierto se rechazan también requests que quizás hubieran funcionado; mal calibrado puede "oscilar". Hay uno **por dependencia**.
+**Qué cuenta como falla:** timeouts, errores de conexión y 5xx. **No los 4xx ni validaciones** (son culpa del llamante; abrirían el breaker por pedidos mal hechos). Puede convenir umbrales distintos por tipo (más bajo para timeouts). El rechazo del breaker debe ser una **excepción distinguible** de un timeout común.
 
-### 4. Bulkheads (mamparos)
+> **Breaker + timeout es obligatorio:** el breaker solo registra una llamada cuando **termina**; sin timeout, la falla lenta **nunca termina** y el breaker no la ve.
 
-**Idea:** como los compartimentos estancos de un barco. Si se inunda uno, el barco no se hunde. Se **separan los recursos** (pools de hilos, conexiones, colas) por dependencia o por tipo de cliente.
+### ¿Cuándo abrir? Fallas consecutivas vs. tasa de fallas
 
-**Ejemplo:** si el generador usa **un solo pool** de hilos para las cuatro dependencias, cuando "especiales" se pone lento sus llamadas bloqueadas ocupan todo el pool y **también fallan** mayúsculas, minúsculas y dígitos. Con un pool **por dependencia**, la lentitud queda **contenida**.
+Un contador simple no sirve: no es lo mismo 5 fallas en 5 horas que en 30 segundos. Importa la **densidad**.
 
-**Costo:** recursos menos aprovechados (capacidad ociosa en cada compartimento) y más configuración.
+**Política de k fallas consecutivas** (un éxito reinicia el conteo). Llamadas esperadas hasta ver k fallas seguidas con probabilidad p: **E = (1 − pᵏ) / ((1 − p) · pᵏ)**.
 
-### 5. Fallbacks y degradación elegante (*graceful degradation*)
+| | p = 10% (normal tolerable) | p = 50% (dependencia enferma) |
+| --- | --- | --- |
+| k = 3 | ≈ 1.110 llamadas (abre por azar) | ≈ 14 llamadas (detecta rápido) |
+| k = 10 | ≈ 1,1 × 10¹⁰ (nunca abre) | ≈ 2.046 llamadas (detecta tarde) |
 
-**Idea:** ante la falla de una dependencia, ofrecer **algo útil** en lugar de un error: un valor en caché, un resultado por defecto, una funcionalidad reducida (ej.: mostrar recomendaciones genéricas si falla el motor personalizado).
+**El dilema:** ningún k sirve para ambas cosas, porque las fallas consecutivas **mezclan tasa de error con volumen de tráfico**. A 100 llamadas/s, con k = 3 y 10% de errores el breaker abre cada ~11 s; si queda abierto 10 s, está abierto **~47% del tiempo** por una tasa que el sistema toleraba.
 
-**Cuidado:** la degradación debe ser **aceptable para el negocio**. En el generador, omitir los especiales **no** lo es: produce una respuesta "exitosa" pero incorrecta. En ese caso es mejor **fallar explícitamente**. (Y por eso, en la Clase 12, el SLI cuenta como bueno solo un "200 con contraseña que cumple la política".)
+**Política de tasa de fallas en una ventana deslizante** (✅ recomendada): mirar las últimas **N** llamadas y abrir si la proporción de fallas ≥ **θ**, pero solo con un **mínimo m** de llamadas. Con N = 50, m = 20, θ = 50%: con 10% real, la probabilidad de abrir es ~10⁻¹² (no abre); con 50% real, abre casi en cuanto junta el mínimo. **Independiente del volumen.** El compromiso pasa al tamaño de ventana: chica = rápida pero ruidosa; grande = estable pero lenta. Variante: abrir también por **proporción de llamadas lentas**.
 
-### 6. Load shedding, rate limiting y backpressure
+**Tiempo abierto:** muy corto → se prueba una dependencia aún enferma una y otra vez; muy largo → se degrada de más tras la recuperación. **Half-open:** limitar las pruebas simultáneas (si pasan todas las llamadas, cada hilo lanza su "prueba" contra una dependencia quizás enferma) y considerar exigir **varios éxitos** para cerrar (evita abrir/cerrar en bucle).
 
-- **Load shedding (descarte de carga):** ante sobrecarga, **rechazar a propósito** parte de las solicitudes (con un error rápido) para poder atender bien al resto, en vez de atender mal a todos. Se elige **qué** descartar: por ejemplo, priorizar a los jugadores que ya están en una partida sobre los que intentan ingresar.
-- **Rate limiting:** limitar cuántas solicitudes acepta cada cliente por unidad de tiempo, para que uno solo no sature el sistema.
-- **Backpressure:** que el receptor **le indique al emisor que baje el ritmo** (colas acotadas, rechazos), en lugar de acumular trabajo sin límite (como el write stall de la Clase 6).
+**Alcance:** un breaker **por dependencia y por proceso**. Compartir estado entre procesos agrega otra comunicación (y un nuevo modo de falla de la propia protección); un único breaker para todas las dependencias haría que la falla de una desconecte a las demás.
 
-## Resumen de mecanismos
+**Con reintentos:** **cada intento** cuenta para el breaker; si un intento lo abre, el siguiente se rechaza y la secuencia termina; y el rechazo **no se reintenta**.
 
-| Mecanismo | Protege contra | Costo / riesgo | Cuándo **no** |
-| --- | --- | --- | --- |
-| Timeout / deadline | Esperas indefinidas, recursos retenidos | Falsos timeouts | Nunca omitirlo; solo calibrarlo |
-| Reintento + backoff + jitter | Fallas transitorias | Duplicados, amplificación de carga | Errores 4xx; operaciones no idempotentes sin clave |
-| Circuit breaker | Seguir golpeando una dependencia rota | Rechaza requests que podrían andar | Dependencias con muy poco tráfico (poca señal) |
-| Bulkhead | Que una dependencia lenta agote recursos comunes | Capacidad ociosa | Sistemas muy simples con una sola dependencia |
-| Fallback / degradación | Que una falla secundaria tumbe la funcionalidad principal | Respuestas de menor calidad | Si la respuesta degradada viola la promesa de negocio |
-| Load shedding / rate limiting | Sobrecarga y colapso total | Usuarios rechazados a propósito | Cuando todo el tráfico es igual de crítico y hay capacidad |
+**Observabilidad:** registrar cada cambio de estado y poder consultarlo; la **frecuencia de cambios** es un indicador adelantado de problemas; operaciones necesita poder abrirlo o reiniciarlo a mano.
 
-> La resiliencia **no se supone**: los mecanismos se configuran en esta clase, pero se **validan** con SLOs y experimentos bajo falla en la Clase 12.
+**Una protección mal implementada:** el breaker es compartido por los hilos, así que debe ser **thread-safe**. Pero si el lock cubre **toda la llamada protegida**, serializa todas las llamadas a la dependencia: mientras un hilo espera una respuesta lenta, los demás esperan el lock. **El lock debe cubrir solo leer/actualizar el estado, nunca la llamada de red.** (Revisar esto antes de adoptar una librería.)
 
-**D = (P, F, G, S, T):** P: una dependencia degradada arrastra al sistema. F: dependencias lentas o caídas, reintentos que amplifican, dependencias ocultas. G: contener la falla, fallar rápido y explícito, no devolver resultados incorrectos. S: timeouts encadenados, reintentos acotados con idempotencia, circuit breaker por dependencia, bulkheads, load shedding. T: más configuración, rechazos deliberados, capacidad ociosa.
+## 4. Degradación elegante (fallback)
 
-> 📝 **Para el parcial (ver pregunta 5 del simulacro):** elegir un límite de espera y una política de reintentos **acotada** con backoff y jitter; explicar qué hace un circuit breaker (abrir, rechazar rápido, probar con pocas llamadas en semiabierto); explicar por qué los reintentos llevan **la misma clave idempotente**; distinguir falla rápida de lenta; justificar un bulkhead; decidir si una degradación es aceptable.
+Cuando la dependencia no está (timeout, breaker abierto), hay que hacer algo con el pedido: devolver la última respuesta buena o un valor en caché, una respuesta genérica en vez de personalizada, o llamar a un servicio secundario.
+
+> **El fallback es una decisión de producto, no técnica.** ¿Acepta un comercio una orden si no puede confirmar stock? ¿Y si no puede verificar la tarjeta? Hablar del circuit breaker suele ser la mejor forma de abrir esa conversación con el negocio.
+
+**Una buena degradación es:**
+- **Explícita** para quien la recibe (ej.: un campo que lista qué partes faltan). Una respuesta degradada presentada como completa convierte una falla visible en un **error silencioso**.
+- **Definida de antemano** con los interesados, no improvisada en el `catch`.
+- **Más barata** que el camino normal (si cuesta lo mismo, no contiene nada).
+
+**Cuándo NO degradar:** en el generador, omitir los especiales produce una contraseña que **viola la política**: "degradar" pasa a ser "responder algo incorrecto". Igual con un cobro sin verificación. Ahí lo correcto es **fallar explícita y rápidamente**, o **diferir** la operación.
+
+> **Un breaker sin fallback falla rápido, pero sigue fallando.** El breaker protege **al sistema**; solo el fallback (o una decisión de producto equivalente) protege **la experiencia del usuario**.
+
+## 5. Bulkheads (mamparos)
+
+Como los compartimentos estancos de un barco: si se perfora uno, se inunda ese y el barco no se hunde. Se **particionan recursos** para que la falla de una parte no destruya el resto ("salvar parte del barco").
+
+**Niveles de partición:**
+- **Hilos en un proceso:** un pool (o tope de concurrencia) **por dependencia**, para que una lenta agote solo su porción. Caso útil: reservar un pool para **tareas administrativas**, para poder diagnosticar o apagar el servicio aunque los hilos de atención estén colgados.
+- **CPUs de un servidor:** fijar procesos a núcleos.
+- **Instancias o clústeres dedicados:** capacidad reservada para clientes críticos (ej.: servidores dedicados al check-in, que no se afectan si las consultas de estado de vuelo saturan los compartidos).
+- **Zonas y regiones** en la nube.
+
+**Costo:** **capacidad ociosa** (la partición reservada está subutilizada casi siempre). No particionar demasiado fino: buscar límites naturales (por llamante, función o topología) según el impacto de negocio.
+
+**En la aerolínea:** el servicio tenía pools separados para llamadas remotas y para HTTP, por eso **seguía respondiendo al monitoreo** y se pudo diagnosticar. Pero el recurso que se agotó (el pool de conexiones a la base) estaba en la partición de los clientes; separar servidores por grupo de clientes habría mantenido el check-in.
+
+## 6. Backpressure y load shedding
+
+*"Todo problema de performance empieza con una cola que se llena en algún lado."* Por la ley de Little, si la cola crece sin límite, el tiempo de respuesta también. → **No debe haber colas no acotadas.** Con una cola acotada llena, las opciones son: fingir aceptar y descartar, aceptar y descartar otro (ej.: el más viejo), **rechazar**, o **bloquear al productor**.
+
+| | Backpressure | Load shedding |
+| --- | --- | --- |
+| Qué hace | **Desacelera al productor** (lo bloquea hasta que haya lugar); idealmente se propaga hasta el cliente | **Rechaza** el trabajo que no podrá completarse a tiempo |
+| Ejemplo | Ventana de recepción de TCP | Un servicio de video en vivo descarta cuadros que ya llegarían tarde |
+| Funciona mejor | Dentro del sistema/empresa, con productores **conocidos y finitos** | **En el borde**, ante demanda efectivamente ilimitada |
+
+**Principios del load shedding:**
+- **Un rechazo rápido es mejor que un timeout lento** (*fail early and cheaply*).
+- Rechazar **lo antes posible**, antes de ocupar recursos en varias capas (los balanceadores del borde son el lugar ideal).
+- "Carga demasiado alta" = cuando los pedidos tardan más que el objetivo de servicio, o con un **semáforo** de pedidos simultáneos.
+- Cada instancia puede responder **503 en su health check** para que el balanceador la saque un rato.
+- Cuando el valor del trabajo **decae con la edad**, descartar lo viejo es mejor que encolarlo.
+
+**Caso Dressy (dos mecanismos sanos que interactúan mal):** la región A empezó a hacer load shedding por CPU. El balanceador estimaba el costo por pedido con la CPU y, como los rechazos "abarataban" los pedidos, concluyó que A era 10× más eficiente y le mandó **más** tráfico (A: 400 req/s; B y C: 40). *"El balanceador no sabía que los pedidos 'eficientes' eran errores."* Corrección: contar cada rechazo como >100% de CPU. **Lección: los mecanismos de control de carga se configuran y evalúan juntos.**
+
+## Combinar mecanismos
+
+**Orden razonable dentro de una llamada (de afuera hacia adentro):**
+1. **Bulkhead:** ¿hay lugar en la partición de esa dependencia? Si no, rechazar ya.
+2. **Circuit breaker:** si la dependencia está enferma, rechazar sin llamar (va antes de llamar y de reintentar).
+3. **Timeout:** el intento real, acotado.
+4. **Reintentos:** si la falla es reintentable, esperar con backoff + jitter y **volver a pasar por el breaker** (cada intento cuenta; si abrió, se corta).
+5. **Fallback:** si todo falló, aplicar la degradación decidida de antemano.
+
+Cada paso ahorra recursos al siguiente.
+
+**Interacciones peligrosas:** reintentos en varias capas que se multiplican; load shedding que engaña al balanceador (Dressy); reintentos que ocupan el pool que un bulkhead intenta proteger; reintentos sincronizados + balanceadores esperando backends colgados (Pokémon GO).
+
+> **Más patrones no es mejor.** "Cantidad de patrones aplicados" nunca es una métrica de calidad. Cada mecanismo agrega configuración, estados y modos de falla; se justifica por la amenaza concreta que contiene y se **verifica con pruebas de carga y de falla** (Clase 12).
+
+**Si falta un eslabón, los demás no compensan:** un breaker sin timeout no ve la falla lenta; un breaker sin fallback falla rápido pero sigue fallando.
+
+## Caso de estudio: la excepción que dejó en tierra a una aerolínea
+
+Un servicio central de búsqueda de vuelos (CF), **diseñado para alta disponibilidad** (clúster, balanceadores redundantes, base con conmutación automática, segundo datacenter, sin puntos únicos de falla), usado por los quioscos de check-in y la respuesta telefónica vía RMI.
+
+- **23 h:** conmutación manual rutinaria de la base. El monitoreo muestra todo disponible.
+- **2:30:** caen **todos** los quioscos del país y la respuesta telefónica (5:30 en la costa este, hora pico). El monitoreo de CF seguía en verde (solo miraba una página de estado).
+- **Causa:** cerrar una consulta sobre conexiones rotas por la conmutación lanzaba una excepción **antes** de devolver la conexión al pool. Tras ~40 llamadas el pool se agotó y **todos los hilos quedaron esperando una conexión que nunca llegaría**; los 40 hilos de los quioscos, esperando a CF (RMI sin timeout). Más de 3 h de caída y vuelos demorados hasta las 15 h.
+
+| Eslabón | Mecanismo que lo corta |
+| --- | --- |
+| Excepción al cerrar la consulta; conexión no devuelta | Revisión y pruebas de falla (la falta original; no todos los defectos se eliminan) |
+| Pool agotado; hilos esperando conexión | **Timeout en el pool** |
+| Llamadas remotas sin timeout | **Timeout en el cliente** |
+| Clientes bloqueando hilos esperando a CF | **Circuit breaker** en el cliente |
+| CF compartido por todos los clientes | **Bulkhead** (grupos de servidores por cliente) |
+| Quioscos y teléfono caídos | **Fallback** acordado con el negocio |
+| Monitoreo que solo miraba una página de estado | **Medir desde el cliente** (Clase 10) |
+
+> **No es realista eliminar todos los defectos: hay que sobrevivirlos.** La pregunta útil es cómo evitar que un defecto en un sistema afecte a todos los demás.
+
+## D = (P, F, G, S, T)
+
+- **P:** impedir que la falla o lentitud de una dependencia se propague.
+- **F:** fallas parciales, dependencias lentas, pools finitos, fan-out, reintentos que amplifican, tráfico no controlable.
+- **G:** contención del daño, latencia acotada, recuperación automática, degradación **explícita** en vez de caída total.
+- **S:** timeouts calibrados con percentiles, reintentos con backoff + jitter y presupuesto, breaker por dependencia con política de tasa, fallback decidido con el negocio, bulkheads, backpressure y load shedding.
+- **T:** capacidad ociosa, respuestas degradadas, complejidad de configuración, falsos positivos/negativos del breaker, interacciones entre mecanismos.
+
+## Errores frecuentes
+
+- Agregar reintentos sin evaluar cuánta carga suman cuando la causa es saturación.
+- Reintentar en varias capas sin calcular el producto de intentos.
+- Elegir el timeout "a ojo" o desde el promedio.
+- Medir la saturación con la CPU cuando lo que se agota son los hilos.
+- Configurar el breaker por fallas consecutivas sin considerar el volumen de tráfico.
+- Creer que un breaker sin fallback protege al usuario, o que toda degradación es aceptable.
+- Configurar por separado mecanismos que interactúan (load shedding + balanceo).
+- Creer que más patrones = más resiliencia.
+
+> **Un sistema resiliente no es el que no falla, sino el que falla de la forma que se diseñó: rápido, acotado y visible.**
+
+> 📝 **Para el parcial (ver pregunta 5 del simulacro):** distinguir falta/error/falla; explicar por qué una dependencia lenta es peor que una caída; aplicar Little al pool de hilos; calcular 1 − (1 − p)ⁿ con y sin reintentos, Tmax de una llamada con reintentos y la multiplicación de reintentos por capas; elegir un timeout desde percentiles; explicar backoff, jitter y retry budget; describir los estados del breaker, qué cuenta como falla y por qué preferir tasa en ventana a fallas consecutivas; decidir si una degradación es aceptable; justificar un bulkhead; diferenciar backpressure y load shedding; ordenar los mecanismos dentro de una llamada; recorrer la cadena del caso aerolínea.
 
 ---
 
